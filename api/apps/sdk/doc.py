@@ -18,6 +18,9 @@ import logging
 import pathlib
 import re
 from io import BytesIO
+import requests
+from urllib.parse import urlparse
+import os
 
 import xxhash
 from flask import request, send_file
@@ -45,6 +48,83 @@ from rag.utils.storage_factory import STORAGE_IMPL
 MAXIMUM_OF_UPLOADING_FILES = 256
 
 
+class FileFromURL:
+    """模拟文件对象用于 URL 下载的文件"""
+    def __init__(self, content, filename):
+        self.content = BytesIO(content)
+        self.filename = filename
+    
+    def read(self):
+        return self.content.getvalue()
+    
+    def seek(self, position, whence=0):
+        return self.content.seek(position, whence)
+    
+    def tell(self):
+        return self.content.tell()
+
+
+def download_file_from_url(url, timeout=30):
+    """
+    从 URL 下载文件
+    
+    Args:
+        url: 文件 URL
+        timeout: 下载超时时间（秒）
+    
+    Returns:
+        tuple: (FileFromURL对象, None) 成功时，(None, 错误信息) 失败时
+    """
+    try:
+        # 验证 URL 格式
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            return None, f"Invalid URL format: {url}"
+        
+        # 设置请求头
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # 下载文件
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # 获取文件名
+        filename = None
+        content_disposition = response.headers.get('content-disposition')
+        if content_disposition:
+            # 尝试从 Content-Disposition 头获取文件名
+            import re
+            match = re.findall(r'filename[*]?=([^;]+)', content_disposition)
+            if match:
+                filename = match[0].strip('"\'')
+        
+        if not filename:
+            # 从 URL 路径获取文件名
+            filename = os.path.basename(parsed_url.path)
+            if not filename or '.' not in filename:
+                # 如果没有合适的文件名，使用默认名称
+                filename = f"downloaded_file_{hash(url) & 0x7fffffff}.txt"
+        
+        # 读取文件内容
+        content = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            content += chunk
+            # 检查累计大小
+            if len(content) > 100 * 1024 * 1024:
+                return None, "File too large: exceeds 100MB limit"
+        
+        return FileFromURL(content, filename), None
+        
+    except requests.exceptions.Timeout:
+        return None, f"Download timeout after {timeout} seconds"
+    except requests.exceptions.RequestException as e:
+        return None, f"Download failed: {str(e)}"
+    except Exception as e:
+        return None, f"Unexpected error: {str(e)}"
+
+
 class Chunk(BaseModel):
     id: str = ""
     content: str = ""
@@ -69,7 +149,7 @@ class Chunk(BaseModel):
 @token_required
 def upload(dataset_id, tenant_id):
     """
-    Upload documents to a dataset.
+    Upload documents to a dataset via files or URLs.
     ---
     tags:
       - Documents
@@ -89,8 +169,20 @@ def upload(dataset_id, tenant_id):
       - in: formData
         name: file
         type: file
-        required: true
+        required: false
         description: Document files to upload.
+      - in: body
+        name: body
+        description: URLs to download documents from.
+        required: false
+        schema:
+          type: object
+          properties:
+            urls:
+              type: array
+              items:
+                type: string
+              description: List of URLs to download documents from.
     responses:
       200:
         description: Successfully uploaded documents.
@@ -124,35 +216,81 @@ def upload(dataset_id, tenant_id):
                     type: string
                     description: Processing status.
     """
-    if "file" not in request.files:
-        return get_error_data_result(message="No file part!", code=settings.RetCode.ARGUMENT_ERROR)
-    file_objs = request.files.getlist("file")
-    for file_obj in file_objs:
-        if file_obj.filename == "":
-            return get_result(message="No file selected!", code=settings.RetCode.ARGUMENT_ERROR)
-        if len(file_obj.filename.encode("utf-8")) > FILE_NAME_LEN_LIMIT:
-            return get_result(message=f"File name must be {FILE_NAME_LEN_LIMIT} bytes or less.", code=settings.RetCode.ARGUMENT_ERROR)
-    """
-    # total size
-    total_size = 0
-    for file_obj in file_objs:
-        file_obj.seek(0, os.SEEK_END)
-        total_size += file_obj.tell()
-        file_obj.seek(0)
-    MAX_TOTAL_FILE_SIZE = 10 * 1024 * 1024
-    if total_size > MAX_TOTAL_FILE_SIZE:
-        return get_result(
-            message=f"Total file size exceeds 10MB limit! ({total_size / (1024 * 1024):.2f} MB)",
-            code=settings.RetCode.ARGUMENT_ERROR,
-        )
-    """
+    # 检查数据集是否存在
     e, kb = KnowledgebaseService.get_by_id(dataset_id)
     if not e:
         raise LookupError(f"Can't find the dataset with ID {dataset_id}!")
+    
+    file_objs = []
+    upload_errors = []
+    
+    # 处理文件上传
+    if "file" in request.files:
+        uploaded_files = request.files.getlist("file")
+        for file_obj in uploaded_files:
+            if file_obj.filename == "":
+                upload_errors.append("Empty filename in uploaded files")
+                continue
+            if len(file_obj.filename.encode("utf-8")) > FILE_NAME_LEN_LIMIT:
+                upload_errors.append(f"File name '{file_obj.filename}' exceeds {FILE_NAME_LEN_LIMIT} bytes limit")
+                continue
+            file_objs.append(file_obj)
+    
+    # 处理 URL 下载
+    logging.info("Processing URL downloads")
+    urls = []
+    if request.is_json:
+        json_data = request.get_json()
+        if json_data and "urls" in json_data:
+            urls = json_data.get("urls", [])
+    elif request.form.get("urls"):
+        # 支持 form-data 中的 URLs（逗号分隔）
+        urls = [url.strip() for url in request.form.get("urls").split(",") if url.strip()]
+    logging.info(f"Found URLs: {urls}")
+    if urls:
+        if not isinstance(urls, list):
+            return get_error_data_result(message="URLs must be a list", code=settings.RetCode.ARGUMENT_ERROR)
+        
+        # 限制 URL 数量
+        if len(urls) > 10:
+            return get_error_data_result(message="Maximum 10 URLs allowed per request", code=settings.RetCode.ARGUMENT_ERROR)
+        
+        for url in urls:
+            if not isinstance(url, str) or not url.strip():
+                upload_errors.append(f"Invalid URL: {url}")
+                continue
+            
+            file_obj, error = download_file_from_url(url.strip())
+            if error:
+                upload_errors.append(f"URL '{url}': {error}")
+                continue
+            
+            if len(file_obj.filename.encode("utf-8")) > FILE_NAME_LEN_LIMIT:
+                upload_errors.append(f"Downloaded file name '{file_obj.filename}' exceeds {FILE_NAME_LEN_LIMIT} bytes limit")
+                continue
+            
+            file_objs.append(file_obj)
+    
+    # 检查是否有文件要处理
+    if not file_objs:
+        if upload_errors:
+            return get_error_data_result(message="No valid files to upload. Errors: " + "; ".join(upload_errors), code=settings.RetCode.ARGUMENT_ERROR)
+        else:
+            return get_error_data_result(message="No files or URLs provided", code=settings.RetCode.ARGUMENT_ERROR)
+    
+    # 限制文件数量
+    if len(file_objs) > MAXIMUM_OF_UPLOADING_FILES:
+        return get_error_data_result(message=f"Maximum {MAXIMUM_OF_UPLOADING_FILES} files allowed per request", code=settings.RetCode.ARGUMENT_ERROR)
+    
+    # 上传文档
     err, files = FileService.upload_document(kb, file_objs, tenant_id)
-    if err:
-        return get_result(message="\n".join(err), code=settings.RetCode.SERVER_ERROR)
-    # rename key's name
+    
+    # 合并所有错误信息
+    all_errors = upload_errors + err
+    if all_errors and not files:
+        return get_result(message="\n".join(all_errors), code=settings.RetCode.SERVER_ERROR)
+    
+    # 重命名键名
     renamed_doc_list = []
     for file in files:
         doc = file[0]
@@ -168,6 +306,7 @@ def upload(dataset_id, tenant_id):
             renamed_doc[new_key] = value
         renamed_doc["run"] = "UNSTART"
         renamed_doc_list.append(renamed_doc)
+    
     return get_result(data=renamed_doc_list)
 
 
